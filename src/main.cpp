@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <RTClib.h>
 #include <TM1637Display.h>
+#include <BluetoothSerial.h>
 
 // Pin definitions
 #define BTN_HOUR   4
@@ -33,6 +34,12 @@
 // Object instances
 RTC_DS3231 rtc;
 TM1637Display display(TM_CLK, TM_DIO);
+BluetoothSerial SerialBT;
+
+// Forward declarations
+void beep(uint16_t ms);
+void beepPattern(uint8_t count, uint16_t duration, uint16_t gap);
+void stopAllAlerts();
 
 // Alarm state
 struct AlarmState {
@@ -77,6 +84,146 @@ int lastMinute = -1;
 unsigned long lastDebugPrint = 0;
 
 // ==================== HELPER FUNCTIONS ====================
+
+void sendBTStatus() {
+  DateTime now = rtc.now();
+  SerialBT.println("\n=== STATUS ===");
+  SerialBT.printf("Time: %02d:%02d:%02d\n", now.hour(), now.minute(), now.second());
+  SerialBT.printf("Alarm: %02d:%02d | Enabled:%d Ringing:%d\n",
+                alarmState.hour, alarmState.minute, alarmState.enabled, alarmState.ringing);
+  SerialBT.printf("Pomodoro: Running:%d Phase:%s Work:%dmin Break:%dmin\n",
+                pomo.running, pomo.workPhase ? "WORK" : "BREAK", pomo.workMin, pomo.breakMin);
+}
+
+void handleBluetoothCommands() {
+  if (!SerialBT.available()) return;
+  
+  String cmd = SerialBT.readStringUntil('\n');
+  cmd.trim();
+  cmd.toLowerCase();
+  
+  if (cmd == "status") {
+    sendBTStatus();
+  }
+  else if (cmd == "help") {
+    SerialBT.println("\n=== BLUETOOTH COMMANDS ===");
+    SerialBT.println("status - Show current status");
+    SerialBT.println("time HH:MM:SS - Set current time");
+    SerialBT.println("alarm HH:MM - Set alarm time");
+    SerialBT.println("alarm on - Enable alarm");
+    SerialBT.println("alarm off - Disable alarm");
+    SerialBT.println("pomo start - Start pomodoro");
+    SerialBT.println("pomo stop - Stop pomodoro");
+    SerialBT.println("pomo work MM - Set work duration");
+    SerialBT.println("pomo break MM - Set break duration");
+    SerialBT.println("reset - Reset all timers");
+    SerialBT.println("help - Show this message");
+  }
+  else if (cmd.startsWith("time ")) {
+    // Format: time HH:MM:SS
+    int h, m, s;
+    if (sscanf(cmd.c_str(), "time %d:%d:%d", &h, &m, &s) == 3) {
+      if (h >= 0 && h < 24 && m >= 0 && m < 60 && s >= 0 && s < 60) {
+        DateTime now = rtc.now();
+        rtc.adjust(DateTime(now.year(), now.month(), now.day(), h, m, s));
+        SerialBT.printf("✓ Time set to %02d:%02d:%02d\n", h, m, s);
+        beepPattern(2, 100, 100);
+      } else {
+        SerialBT.println("✗ Invalid time format");
+      }
+    } else {
+      SerialBT.println("✗ Use format: time HH:MM:SS");
+    }
+  }
+  else if (cmd.startsWith("alarm ")) {
+    String subcmd = cmd.substring(6);
+    subcmd.trim();
+    
+    if (subcmd == "on") {
+      alarmState.enabled = true;
+      SerialBT.println("✓ Alarm enabled");
+      beep(200);
+    }
+    else if (subcmd == "off") {
+      alarmState.enabled = false;
+      alarmState.ringing = false;
+      SerialBT.println("✓ Alarm disabled");
+      beep(100);
+    }
+    else {
+      // Format: alarm HH:MM
+      int h, m;
+      if (sscanf(subcmd.c_str(), "%d:%d", &h, &m) == 2) {
+        if (h >= 0 && h < 24 && m >= 0 && m < 60) {
+          alarmState.hour = h;
+          alarmState.minute = m;
+          alarmState.enabled = true;
+          SerialBT.printf("✓ Alarm set to %02d:%02d\n", h, m);
+          beepPattern(2, 150, 100);
+        } else {
+          SerialBT.println("✗ Invalid time values");
+        }
+      } else {
+        SerialBT.println("✗ Use format: alarm HH:MM");
+      }
+    }
+  }
+  else if (cmd.startsWith("pomo ")) {
+    String subcmd = cmd.substring(5);
+    subcmd.trim();
+    
+    if (subcmd == "start") {
+      if (!pomo.running) {
+        pomo.running = true;
+        pomo.startMillis = millis();
+        pomo.duration = (pomo.workPhase ? pomo.workMin : pomo.breakMin) * 60000UL;
+        SerialBT.printf("✓ Pomodoro started: %s (%d min)\n", 
+                       pomo.workPhase ? "WORK" : "BREAK",
+                       pomo.workPhase ? pomo.workMin : pomo.breakMin);
+        beepPattern(2, 100, 100);
+      } else {
+        SerialBT.println("⚠ Pomodoro already running");
+      }
+    }
+    else if (subcmd == "stop") {
+      pomo.running = false;
+      pomo.ringing = false;
+      SerialBT.println("✓ Pomodoro stopped");
+      beep(100);
+    }
+    else if (subcmd.startsWith("work ")) {
+      int mins = subcmd.substring(5).toInt();
+      if (mins > 0 && mins <= 99) {
+        pomo.workMin = mins;
+        SerialBT.printf("✓ Work duration set to %d min\n", mins);
+        beep(100);
+      } else {
+        SerialBT.println("✗ Value must be 1-99 minutes");
+      }
+    }
+    else if (subcmd.startsWith("break ")) {
+      int mins = subcmd.substring(6).toInt();
+      if (mins > 0 && mins <= 99) {
+        pomo.breakMin = mins;
+        SerialBT.printf("✓ Break duration set to %d min\n", mins);
+        beep(100);
+      } else {
+        SerialBT.println("✗ Value must be 1-99 minutes");
+      }
+    }
+    else {
+      SerialBT.println("✗ Unknown pomo command. Try: start, stop, work MM, break MM");
+    }
+  }
+  else if (cmd == "reset") {
+    stopAllAlerts();
+    SerialBT.println("✓ All timers reset");
+    beep(200);
+  }
+  else {
+    SerialBT.println("✗ Unknown command. Type 'help' for commands");
+  }
+}
 
 void beep(uint16_t ms) {
   ledcWrite(BUZZER_CHANNEL, 128);
@@ -344,9 +491,17 @@ void setup() {
   ledcSetup(BUZZER_CHANNEL, BUZZER_FREQ, BUZZER_RES);
   ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
 
+  // Initialize Bluetooth
+  if (!SerialBT.begin("ESP32_Clock")) {
+    Serial.println("ERROR: Bluetooth failed to start!");
+  } else {
+    Serial.println("Bluetooth started: ESP32_Clock");
+  }
+
   // Startup sequence
   Serial.println("\n╔════════════════════════════════╗");
   Serial.println("║ ALARM + POMODORO CLOCK v2.0    ║");
+  Serial.println("║ Bluetooth: ESP32_Clock         ║");
   Serial.println("╚════════════════════════════════╝");
   beepPattern(2, 200, 200);
 }
@@ -355,6 +510,9 @@ void setup() {
 
 void loop() {
   DateTime now = rtc.now();
+
+  // Handle Bluetooth commands
+  handleBluetoothCommands();
 
   // Periodic debug output
   if (millis() - lastDebugPrint > DEBUG_INTERVAL_MS) {
